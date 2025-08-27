@@ -1,6 +1,5 @@
 #include "sam.h"
 #include "GPIO_DEAKIN.h"
-#include "TIMER_DEAKIN.h"
 
 // Define LED pin structure
 typedef struct {
@@ -26,7 +25,9 @@ volatile int state = 0;  // 0=STOP, 1=RUN, 2=RESET
 volatile int pos = 0;
 volatile int dir = 1;
 
-void updateLEDs(); // Forward declaration
+// Forward declarations
+void updateLEDs();
+void TCC0_init(uint32_t ms_tick);
 
 // ---------------- Button ISR ----------------
 void EIC_Handler(void){
@@ -52,6 +53,50 @@ void updateLEDs(){
         Write_GPIO(leds[i].port, leds[i].pin, LOW);
     }
     Write_GPIO(leds[pos].port, leds[pos].pin, HIGH);
+}
+
+// ---------------- TCC0 Initialization ----------------
+void TCC0_init(uint32_t ms_tick) {
+    // Enable APB clock for TCC0
+    PM->APBCMASK.reg |= PM_APBCMASK_TCC0;
+
+    // Configure GCLK1 = 1 kHz (approx.)
+    GCLK->GENDIV.reg = GCLK_GENDIV_ID(1) | GCLK_GENDIV_DIV(48000);
+    while(GCLK->STATUS.bit.SYNCBUSY);
+    GCLK->GENCTRL.reg = GCLK_GENCTRL_ID(1) | GCLK_GENCTRL_SRC_DFLL48M | GCLK_GENCTRL_GENEN;
+    while(GCLK->STATUS.bit.SYNCBUSY);
+
+    // Route GCLK1 to TCC0
+    GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_TCC0_TCC1 | GCLK_CLKCTRL_GEN_GCLK1 | GCLK_CLKCTRL_CLKEN;
+    while(GCLK->STATUS.bit.SYNCBUSY);
+
+    // Reset TCC0
+    TCC0->CTRLA.reg = TCC_CTRLA_SWRST;
+    while(TCC0->SYNCBUSY.reg & TCC_SYNCBUSY_SWRST);
+
+    // Prescaler = 1
+    TCC0->CTRLA.reg = TCC_CTRLA_PRESCALER(TCC_CTRLA_PRESCALER_DIV1_Val);
+    while(TCC0->SYNCBUSY.reg);
+
+    // Normal PWM mode
+    TCC0->WAVE.reg = TCC_WAVE_WAVEGEN_NPWM;
+    while(TCC0->SYNCBUSY.reg & TCC_SYNCBUSY_WAVE);
+
+    // Set period
+    TCC0->PER.reg = ms_tick - 1;
+    while(TCC0->SYNCBUSY.reg & TCC_SYNCBUSY_PER);
+
+    // Enable overflow interrupt
+    TCC0->INTFLAG.reg = TCC_INTFLAG_MASK;
+    TCC0->INTENSET.reg = TCC_INTENSET_OVF;
+
+    // NVIC
+    NVIC_SetPriority(TCC0_IRQn, 3);
+    NVIC_EnableIRQ(TCC0_IRQn);
+
+    // Enable TCC0
+    TCC0->CTRLA.reg |= TCC_CTRLA_ENABLE;
+    while(TCC0->SYNCBUSY.reg & TCC_SYNCBUSY_ENABLE);
 }
 
 // ---------------- Setup ----------------
