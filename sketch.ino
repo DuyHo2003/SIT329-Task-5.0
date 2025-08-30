@@ -1,13 +1,13 @@
 #include "sam.h"
 #include "GPIO_DEAKIN.h"
+#include "TIMER_DEAKIN.h"
 
-// Define LED pin structure
+// ----------------- LED Configuration -----------------
 typedef struct {
     char port;   // 'A' or 'B'
     uint8_t pin; // Pin number
 } LedPin;
 
-// LED configuration
 #define NUM_LEDS 6
 LedPin leds[NUM_LEDS] = {
     {'A', 10}, // LED1
@@ -18,121 +18,99 @@ LedPin leds[NUM_LEDS] = {
     {'A', 21}  // LED6
 };
 
-#define BUTTON_PIN 6 // PA06 for button
+#define BUTTON_PIN 6 // PA6
 
-// Variables
-volatile int state = 0;  // 0=STOP, 1=RUN, 2=RESET
+// ----------------- States -----------------
+#define STOP  0
+#define RUN   1
+#define RESET 2
+
+volatile uint8_t state = STOP;
 volatile int pos = 0;
 volatile int dir = 1;
 
-// Forward declarations
-void updateLEDs();
-void TCC0_init(uint32_t ms_tick);
-
-// ---------------- Button ISR ----------------
-void EIC_Handler(void){
-    state++;
-    if(state > 2) state = 0; // cycle STOP/RUN/RESET
-    if(state == 2){ pos = 0; dir = 1; updateLEDs(); }
-    EIC->INTFLAG.reg = (1 << BUTTON_PIN); // clear interrupt flag
-}
-
-// ---------------- Timer ISR ----------------
-void TCC0_Handler(void){
-    if(state==1){ // RUN mode
-        pos += dir;
-        if(pos==NUM_LEDS-1 || pos==0) dir=-dir;
-        updateLEDs();
-    }
-    TCC0->INTFLAG.reg = TCC_INTFLAG_OVF; // clear timer overflow flag
-}
-
-// ---------------- Helper: Update LEDs ----------------
-void updateLEDs(){
-    for(int i = 0; i < NUM_LEDS; i++) {
+// ----------------- LED Control -----------------
+void update_leds(void) {
+    for (int i = 0; i < NUM_LEDS; i++) {
         Write_GPIO(leds[i].port, leds[i].pin, LOW);
     }
     Write_GPIO(leds[pos].port, leds[pos].pin, HIGH);
 }
 
-// ---------------- TCC0 Initialization ----------------
-void TCC0_init(uint32_t ms_tick) {
-    // Enable APB clock for TCC0
-    PM->APBCMASK.reg |= PM_APBCMASK_TCC0;
-
-    // Configure GCLK1 = 1 kHz (approx.)
-    GCLK->GENDIV.reg = GCLK_GENDIV_ID(1) | GCLK_GENDIV_DIV(48000);
-    while(GCLK->STATUS.bit.SYNCBUSY);
-    GCLK->GENCTRL.reg = GCLK_GENCTRL_ID(1) | GCLK_GENCTRL_SRC_DFLL48M | GCLK_GENCTRL_GENEN;
-    while(GCLK->STATUS.bit.SYNCBUSY);
-
-    // Route GCLK1 to TCC0
-    GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_TCC0_TCC1 | GCLK_CLKCTRL_GEN_GCLK1 | GCLK_CLKCTRL_CLKEN;
-    while(GCLK->STATUS.bit.SYNCBUSY);
-
-    // Reset TCC0
-    TCC0->CTRLA.reg = TCC_CTRLA_SWRST;
-    while(TCC0->SYNCBUSY.reg & TCC_SYNCBUSY_SWRST);
-
-    // Prescaler = 1
-    TCC0->CTRLA.reg = TCC_CTRLA_PRESCALER(TCC_CTRLA_PRESCALER_DIV1_Val);
-    while(TCC0->SYNCBUSY.reg);
-
-    // Normal PWM mode
-    TCC0->WAVE.reg = TCC_WAVE_WAVEGEN_NPWM;
-    while(TCC0->SYNCBUSY.reg & TCC_SYNCBUSY_WAVE);
-
-    // Set period
-    TCC0->PER.reg = ms_tick - 1;
-    while(TCC0->SYNCBUSY.reg & TCC_SYNCBUSY_PER);
-
-    // Enable overflow interrupt
-    TCC0->INTFLAG.reg = TCC_INTFLAG_MASK;
-    TCC0->INTENSET.reg = TCC_INTENSET_OVF;
-
-    // NVIC
-    NVIC_SetPriority(TCC0_IRQn, 3);
-    NVIC_EnableIRQ(TCC0_IRQn);
-
-    // Enable TCC0
-    TCC0->CTRLA.reg |= TCC_CTRLA_ENABLE;
-    while(TCC0->SYNCBUSY.reg & TCC_SYNCBUSY_ENABLE);
-}
-
-// ---------------- Setup ----------------
-void setup(){
-    SystemInit();
-
-    // Initialize LEDs
-    for(int i = 0; i < NUM_LEDS; i++){
+void led_init(void) {
+    for (int i = 0; i < NUM_LEDS; i++) {
         Config_GPIO(leds[i].port, leds[i].pin, OUTPUT);
         Write_GPIO(leds[i].port, leds[i].pin, LOW);
     }
+}
 
-    // Initialize button with EIC interrupt
-    PORT->Group[0].DIRCLR.reg = (1 << BUTTON_PIN);
+// ----------------- Button ISR -----------------
+void EIC_Handler(void) {
+    // Cycle through states: STOP → RUN → RESET → STOP ...
+    if (state == STOP) {
+        state = RUN;
+    } else if (state == RUN) {
+        state = STOP;
+    } else if (state == RESET) {
+        // Perform reset now
+        pos = 0;
+        dir = 1;
+        update_leds();
+        state = STOP; // After reset, go to STOP
+    }
+
+    // Prepare for next press (if RUN→RESET)
+    if (state == STOP && pos != 0) {
+        state = RESET; // Next press will trigger RESET
+    }
+
+    EIC->INTFLAG.reg = (1 << 6); // Clear interrupt flag
+}
+
+// ----------------- Button Init -----------------
+void button_init(void) {
+    PORT->Group[0].DIRCLR.reg = (1 << BUTTON_PIN); // input
     PORT->Group[0].PINCFG[BUTTON_PIN].bit.INEN = 1;
     PORT->Group[0].PINCFG[BUTTON_PIN].bit.PMUXEN = 1;
     PORT->Group[0].PMUX[BUTTON_PIN >> 1].bit.PMUXE = MUX_PA06A_EIC_EXTINT6;
 
     PM->APBAMASK.reg |= PM_APBAMASK_EIC;
+
     GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_EIC | GCLK_CLKCTRL_GEN_GCLK0 | GCLK_CLKCTRL_CLKEN;
-    while(GCLK->STATUS.bit.SYNCBUSY);
+    while (GCLK->STATUS.bit.SYNCBUSY);
 
     EIC->CONFIG[0].reg &= ~EIC_CONFIG_SENSE6_Msk;
     EIC->CONFIG[0].reg |= EIC_CONFIG_SENSE6_FALL;
-    EIC->INTENSET.reg = (1 << BUTTON_PIN);
+    EIC->INTENSET.reg = (1 << 6);
+
     EIC->CTRL.bit.ENABLE = 1;
-    while(EIC->STATUS.bit.SYNCBUSY);
+    while (EIC->STATUS.bit.SYNCBUSY);
+
     NVIC_EnableIRQ(EIC_IRQn);
-
-    // Initialize TCC0 timer for 200ms interrupts
-    TCC0_init(200);
-
-    __enable_irq();
 }
 
-// ---------------- Main Loop ----------------
-void loop(){
-    __WFI(); // Wait for interrupts
+// ----------------- Timer ISR -----------------
+void TCC0_Handler(void) {
+    if (state == RUN) {
+        pos += dir;
+        if (pos == NUM_LEDS - 1 || pos == 0) {
+            dir = -dir;
+        }
+        update_leds();
+    }
+    TCC0->INTFLAG.reg = TCC_INTFLAG_OVF; // clear overflow flag
+}
+
+// ----------------- Main -----------------
+int main(void) {
+    SystemInit();
+    led_init();
+    button_init();
+    update_leds(); // Ensure first LED starts ON
+    TCC0_init(200); // 200 ms per step
+    __enable_irq();
+
+    while (1) {
+        // Idle loop; ISRs manage LEDs
+    }
 }
